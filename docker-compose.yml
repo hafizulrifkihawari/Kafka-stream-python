@@ -1,0 +1,187 @@
+version: "2.4"
+services:
+  broker:
+    image: quay.io/strimzi/kafka:0.34.0-kafka-3.4.0
+    command:
+      - sh
+      - -c
+      - |-
+        mkdir -p /home/kafka/data &&
+        chown -R kafka /home/kafka/data &&
+        su -c "./bin/kafka-storage.sh format -t $$(./bin/kafka-storage.sh random-uuid) -c ./custom-config/server.properties --ignore-formatted" &&
+        su -c "./bin/kafka-server-start.sh ./custom-config/server.properties"
+    environment:
+      LOG_DIR: /tmp/logs
+      KAFKA_JVM_PERFORMANCE_OPTS: -Xmx1000m -Xms1000m
+    ports:
+      - "127.0.0.1:29092:29092"
+    init: true
+    tty: true
+    user: root
+    volumes:
+      - ./docker-compose/kafka-server.properties:/opt/kafka/custom-config/server.properties
+      - kafka-data:/home/kafka/data
+    mem_limit: 1.5g
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.0.6
+    container_name: schema-registry
+    depends_on:
+      - broker
+    ports:
+      - "127.0.0.1:28081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "broker:9092"
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+
+  # Our primary datastore.
+  postgres:
+    image: debezium/postgres:14-alpine
+    command:
+      - -c
+      - wal_level=logical
+      - -c
+      - log_min_duration_statement=0
+      - -c
+      - log_statement=all
+      - -c
+      - log_duration=on
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_parallel_maintenance_workers=8
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-unleash.sh:/docker-entrypoint-initdb.d/init-unleash.sh
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    shm_size: 1g
+
+  connect:
+    image: debezium/connect:1.9.6.Final
+    container_name: connect
+    depends_on:
+      - broker
+      - schema-registry
+    ports:
+      - "127.0.0.1:28083:8083"
+    environment:
+      - BOOTSTRAP_SERVERS=broker:9092
+      - REST_PORT=8083
+      - GROUP_ID=1
+      - CONFIG_STORAGE_TOPIC=my_connect_configs
+      - OFFSET_STORAGE_TOPIC=my_connect_offsets
+      - REST_ADVERTISED_HOST_NAME=kafka-connect-01
+      - LOG4J_ROOT_LOGLEVEL=INFO
+      - LOG4J_LOGGERS=org.apache.kafka.connect.runtime.rest=WARN,org.reflections=ERROR
+      - LOG4J_APPENDER_STDOUT_LAYOUT_CONVERSIONPATTERN=[%d] %p %X{connector.context}%m (%c:%L)%n
+      - STATUS_STORAGE_TOPIC=my_connect_statuses
+      - KEY_CONVERTER=io.confluent.connect.avro.AvroConverter
+      - VALUE_CONVERTER=io.confluent.connect.avro.AvroConverter
+      - INTERNAL_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - INTERNAL_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL=http://schema-registry:8081
+      - CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL=http://schema-registry:8081
+      - CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY=All
+      - HEAP_OPTS=-Xmx512M
+    mem_limit: 1g
+
+  sink-connect:
+    image: confluentinc/cp-kafka-connect:7.0.6
+    container_name: sink-connect
+    entrypoint:
+      - /bin/bash
+      - --
+      - /config/entrypoint/sink-connect-entrypoint.sh
+    depends_on:
+      - broker
+      - schema-registry
+      - elasticsearch
+    ports:
+      - 28084:8083
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: "broker:9092"
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: kafka-connect-540
+      CONNECT_CONFIG_STORAGE_TOPIC: kafka-sink-connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: kafka-sink-connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: kafka-sink-connect-status
+      CONNECT_REST_ADVERTISED_HOST_NAME: "kafka-connect-02"
+      CONNECT_LOG4J_ROOT_LOGLEVEL: "INFO"
+      CONNECT_LOG4J_LOGGERS: "org.apache.kafka.connect.runtime.rest=WARN,org.reflections=ERROR"
+      CONNECT_LOG4J_APPENDER_STDOUT_LAYOUT_CONVERSIONPATTERN: "[%d] %p %X{connector.context}%m (%c:%L)%n"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+      TRUST_STORE_PASSWORD: glints1234
+      KAFKA_HEAP_OPTS: -Xmx1500M
+    volumes:
+      - ./docker-compose/:/config
+    mem_limit: 2000m
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.11.2
+    container_name: elasticsearch
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - elasticsearchData:/usr/share/elasticsearch/data
+    environment:
+      - ELASTIC_PASSWORD=glints
+      - ES_JAVA_OPTS=-Xmx1000m -Xms1000m
+      - discovery.type=single-node
+      - xpack.license.self_generated.type=basic
+      - cluster.routing.allocation.disk.threshold_enabled=false
+    mem_limit: 1.5g
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop
+    container_name: kafdrop
+    depends_on:
+      - broker
+      - schema-registry
+    ports:
+      - "127.0.0.1:19092:9000"
+    environment:
+      KAFKA_BROKERCONNECT: "broker:9092"
+      SERVER_PORT: 9000
+      SCHEMAREGISTRY_CONNECT: http://schema-registry:8081
+
+  grafana:
+    image: grafana/grafana:8.3.7
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/datasources:/etc/grafana/provisioning/datasources
+      - grafana-data:/var/lib/grafana
+    network_mode: host
+
+  kafka-ui:
+    container_name: kafka-ui
+    image: provectuslabs/kafka-ui:latest
+    environment:
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports:
+      - "127.0.0.1:28080:8080"
+
+volumes:
+  elasticsearchData:
+    name: elasticsearch-data
+  kafka-data:
+    name: kafka-data
+  postgres-data:
+    name: postgres-data
+  grafana-data:
+    name: grafana-data

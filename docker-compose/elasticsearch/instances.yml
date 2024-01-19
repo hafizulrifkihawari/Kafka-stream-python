@@ -1,0 +1,5 @@
+# Used by elasticsearch-certutil to generate TLS certificates to enable
+# security. For more information, see:
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/certutil.html#certutil-silent
+instances:
+  - name: elasticsearch

@@ -1,1 +1,1 @@
-# Kafka-stream-python
+# Kafka Stream Scala Application
